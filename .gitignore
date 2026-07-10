@@ -1,0 +1,5 @@
+wlrd-capture
+wlrd-globals
+gen/
+*.ppm
+*.png
