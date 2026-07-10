@@ -13,7 +13,7 @@ LDLIBS  = $(shell pkg-config --libs $(PKGS))
 
 SCREENCOPY_XML = protocol/wlr-screencopy-unstable-v1.xml
 
-all: wlrd-capture wlrd-globals
+all: wlrd-capture wlrd-bench wlrd-globals
 
 # --- プロトコルコード生成 --------------------------------------------------
 # client-header: クライアント用 API 宣言
@@ -33,11 +33,15 @@ gen/wlr-screencopy-unstable-v1.c: $(SCREENCOPY_XML)
 wlrd-capture: src/wlrd-capture.c gen/wlr-screencopy-unstable-v1.c gen/wlr-screencopy-unstable-v1.h
 	$(CC) $(CFLAGS) -o $@ src/wlrd-capture.c gen/wlr-screencopy-unstable-v1.c $(LDLIBS)
 
+# Stage 2: 連続キャプチャの FPS / damage 測定
+wlrd-bench: src/wlrd-bench.c gen/wlr-screencopy-unstable-v1.c gen/wlr-screencopy-unstable-v1.h
+	$(CC) $(CFLAGS) -o $@ src/wlrd-bench.c gen/wlr-screencopy-unstable-v1.c $(LDLIBS)
+
 # Stage 0: コンポジタのグローバル列挙
 wlrd-globals: tools/globals.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
-	rm -rf gen wlrd-capture wlrd-globals
+	rm -rf gen wlrd-capture wlrd-bench wlrd-globals
 
 .PHONY: all clean
