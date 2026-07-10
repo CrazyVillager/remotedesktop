@@ -3,3 +3,6 @@ wlrd-globals
 gen/
 *.ppm
 *.png
+wlrd-send
+wlrd-view
+wlrd-bench

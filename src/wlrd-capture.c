@@ -22,6 +22,7 @@
  * 本質的な違いである。
  */
 #define _GNU_SOURCE /* memfd_create のため */
+#include "outputs.h"
 #include "wlr-screencopy-unstable-v1.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -36,7 +37,8 @@
 struct state {
   /* registry で見つけたグローバル */
   struct wl_shm *shm;
-  struct wl_output *output; /* 最初に見つけた出力 */
+  struct wlrd_outputs outs;
+  struct wl_output *output; /* -o で選択された出力 */
   struct zwlr_screencopy_manager_v1 *screencopy;
 
   /* コンポジタが "buffer" イベントで提示してきたバッファ仕様 */
@@ -67,9 +69,7 @@ static void registry_global(void *data, struct wl_registry *registry,
   if (strcmp(interface, wl_shm_interface.name) == 0) {
     st->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
   } else if (strcmp(interface, wl_output_interface.name) == 0) {
-    /* 複数出力があっても最初の1つだけ使う（Stage 1 の割り切り） */
-    if (!st->output)
-      st->output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+    wlrd_outputs_bind(&st->outs, registry, name, version);
   } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) ==
              0) {
     /* buffer_done イベントを使うため v3 を要求する。
@@ -276,11 +276,28 @@ static int write_ppm(struct state *st, FILE *out) {
 
 /* ------------------------------------------------------------------ main */
 
-int main(void) {
+int main(int argc, char **argv) {
   struct state st = {0};
+  int out_idx = 0;
+  int list_only = 0;
+
+  int opt;
+  while ((opt = getopt(argc, argv, "o:lh")) != -1) {
+    switch (opt) {
+    case 'o':
+      out_idx = atoi(optarg);
+      break;
+    case 'l':
+      list_only = 1;
+      break;
+    default:
+      fprintf(stderr, "使い方: %s [-o 出力番号] [-l 出力一覧]\n", argv[0]);
+      return 2;
+    }
+  }
 
   /* PPM はバイナリなので端末への垂れ流しを防ぐ */
-  if (isatty(STDOUT_FILENO)) {
+  if (!list_only && isatty(STDOUT_FILENO)) {
     fprintf(stderr, "使い方: wlrd-capture > frame.ppm\n"
                     "        wlrd-capture | magick ppm:- frame.png\n");
     return 2;
@@ -294,15 +311,26 @@ int main(void) {
 
   struct wl_registry *registry = wl_display_get_registry(display);
   wl_registry_add_listener(registry, &registry_listener, &st);
-  /* roundtrip 1回目: global イベントを受け取り bind する */
+  /* roundtrip 1回目: global の bind、2回目: wl_output の name 受信 */
+  wl_display_roundtrip(display);
   wl_display_roundtrip(display);
 
-  if (!st.shm || !st.output || !st.screencopy) {
-    fprintf(stderr,
-            "エラー: 必要なプロトコルが不足 (shm=%p output=%p screencopy=%p)\n",
-            (void *)st.shm, (void *)st.output, (void *)st.screencopy);
+  if (list_only) {
+    for (int i = 0; i < st.outs.count; i++)
+      printf("%d\t%s\n", i, st.outs.names[i]);
+    return 0;
+  }
+
+  if (!st.shm || st.outs.count == 0 || !st.screencopy) {
+    fprintf(stderr, "エラー: 必要なプロトコルが不足している\n");
     return 1;
   }
+  if (out_idx < 0 || out_idx >= st.outs.count) {
+    fprintf(stderr, "エラー: 出力番号 %d は範囲外（0〜%d。-l で一覧）\n",
+            out_idx, st.outs.count - 1);
+    return 2;
+  }
+  st.output = st.outs.outputs[out_idx];
 
   /* キャプチャ要求。overlay_cursor=0 でカーソルは含めない */
   struct zwlr_screencopy_frame_v1 *frame =

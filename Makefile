@@ -13,7 +13,10 @@ LDLIBS  = $(shell pkg-config --libs $(PKGS))
 
 SCREENCOPY_XML = protocol/wlr-screencopy-unstable-v1.xml
 
-all: wlrd-capture wlrd-bench wlrd-globals
+SDL_CFLAGS = $(shell pkg-config --cflags sdl2)
+SDL_LIBS   = $(shell pkg-config --libs sdl2)
+
+all: wlrd-capture wlrd-bench wlrd-send wlrd-view wlrd-globals
 
 # --- プロトコルコード生成 --------------------------------------------------
 # client-header: クライアント用 API 宣言
@@ -30,18 +33,26 @@ gen/wlr-screencopy-unstable-v1.c: $(SCREENCOPY_XML)
 # --- ツール -----------------------------------------------------------------
 
 # Stage 1: 1フレームキャプチャ → PPM
-wlrd-capture: src/wlrd-capture.c gen/wlr-screencopy-unstable-v1.c gen/wlr-screencopy-unstable-v1.h
+wlrd-capture: src/wlrd-capture.c src/outputs.h gen/wlr-screencopy-unstable-v1.c gen/wlr-screencopy-unstable-v1.h
 	$(CC) $(CFLAGS) -o $@ src/wlrd-capture.c gen/wlr-screencopy-unstable-v1.c $(LDLIBS)
 
 # Stage 2: 連続キャプチャの FPS / damage 測定
 wlrd-bench: src/wlrd-bench.c gen/wlr-screencopy-unstable-v1.c gen/wlr-screencopy-unstable-v1.h
 	$(CC) $(CFLAGS) -o $@ src/wlrd-bench.c gen/wlr-screencopy-unstable-v1.c $(LDLIBS)
 
+# Stage 3: 連続キャプチャ → フレームストリーム送信（stdout）
+wlrd-send: src/wlrd-send.c src/proto.h src/outputs.h gen/wlr-screencopy-unstable-v1.c gen/wlr-screencopy-unstable-v1.h
+	$(CC) $(CFLAGS) -o $@ src/wlrd-send.c gen/wlr-screencopy-unstable-v1.c $(LDLIBS)
+
+# Stage 3: フレームストリーム受信（stdin）→ SDL2 表示
+wlrd-view: src/wlrd-view.c src/proto.h
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o $@ src/wlrd-view.c $(SDL_LIBS)
+
 # Stage 0: コンポジタのグローバル列挙
 wlrd-globals: tools/globals.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
-	rm -rf gen wlrd-capture wlrd-bench wlrd-globals
+	rm -rf gen wlrd-capture wlrd-bench wlrd-send wlrd-view wlrd-globals
 
 .PHONY: all clean
