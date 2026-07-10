@@ -145,8 +145,10 @@ int main(int argc, char **argv) {
   /* ---- ストリームヘッダ（この時点ではブロッキング読みでよい） ---- */
   uint8_t shdr[WLRD_STREAM_HDR_SIZE];
   if (read_exact(in_fd, shdr, sizeof shdr) < 0) {
-    fprintf(stderr, "エラー: ストリームヘッダを読めない"
-                    "（wlrd-send からパイプで繋いでいるか？）\n");
+    fprintf(stderr,
+            "エラー: ストリームヘッダを読めない = 送信側が起動直後に"
+            "終了した。真の原因はこの上に出ている ssh / wlrd-send の"
+            "エラー行を見ること\n");
     return 1;
   }
   if (memcmp(shdr, WLRD_MAGIC, 4) != 0 ||

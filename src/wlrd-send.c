@@ -34,6 +34,7 @@
 #include "virtual-keyboard-unstable-v1.h"
 #include "wlr-screencopy-unstable-v1.h"
 #include "wlr-virtual-pointer-unstable-v1.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -46,6 +47,40 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
+
+/* コンポジタへ接続する。ssh 経由の非対話セッションには WAYLAND_DISPLAY が
+ * 無い（リモートデスクトップのホスト側では典型的な状況）ため、未設定なら
+ * XDG_RUNTIME_DIR の wayland-* ソケットを走査して自動検出する */
+static struct wl_display *connect_display(void) {
+  /* WAYLAND_DISPLAY が設定されていればそれに従う */
+  if (getenv("WAYLAND_DISPLAY"))
+    return wl_display_connect(NULL);
+
+  const char *rt = getenv("XDG_RUNTIME_DIR");
+  if (!rt) {
+    fprintf(stderr, "エラー: XDG_RUNTIME_DIR が未設定\n");
+    return NULL;
+  }
+  DIR *dir = opendir(rt);
+  if (!dir)
+    return NULL;
+
+  struct wl_display *display = NULL;
+  struct dirent *ent;
+  while ((ent = readdir(dir)) != NULL) {
+    if (strncmp(ent->d_name, "wayland-", 8) != 0)
+      continue;
+    if (strstr(ent->d_name, ".lock"))
+      continue;
+    display = wl_display_connect(ent->d_name);
+    if (display) {
+      fprintf(stderr, "コンポジタを自動検出: %s/%s\n", rt, ent->d_name);
+      break;
+    }
+  }
+  closedir(dir);
+  return display;
+}
 
 struct state {
   /* グローバル */
@@ -419,9 +454,11 @@ int main(int argc, char **argv) {
   struct state st = {0};
   st.full_copy = full_copy;
 
-  struct wl_display *display = wl_display_connect(NULL);
+  struct wl_display *display = connect_display();
   if (!display) {
-    fprintf(stderr, "エラー: コンポジタに接続できない\n");
+    fprintf(stderr,
+            "エラー: コンポジタに接続できない（Wayland セッション内か？ "
+            "WAYLAND_DISPLAY / XDG_RUNTIME_DIR を確認）\n");
     return 1;
   }
 
