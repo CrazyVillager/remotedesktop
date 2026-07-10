@@ -1,13 +1,20 @@
 /*
- * wlrd-view.c — Stage 3: stdin のフレームストリームを SDL2 ウィンドウに表示する
+ * wlrd-view.c — Stage 3+4: フレームストリームを SDL2 で表示し、入力を送り返す
  *
  * 使い方:
- *   ./wlrd-send | ./wlrd-view              # ローカル確認
- *   ssh host wlrd-send | ./wlrd-view       # リモート表示
- *   q または ESC、ウィンドウクローズで終了する。
+ *   ./wlrd-view ./wlrd-send -o 0           # ローカル（send を子として起動）
+ *   ./wlrd-view ssh host wlrd-send         # リモート（ssh が運び屋）
+ *   ./wlrd-send | ./wlrd-view              # 見るだけ（入力は送れない）
+ *
+ * 引数を与えると、それをトランスポートコマンドとして起動し双方向パイプを
+ * 張る（rsync -e ssh や git と同じ方式）。子の stdout がフレーム、
+ * 子の stdin が入力メッセージの通り道になる。
+ *
+ * 終了はウィンドウクローズ（入力転送中は q/ESC もリモートへ送るため）。
+ * 見るだけモードのときのみ q / ESC でも終了できる。
  *
  * 設計メモ:
- *   - stdin は O_NONBLOCK にし、poll(2) で「SDL イベント処理」と
+ *   - 受信 fd は O_NONBLOCK にし、poll(2) で「SDL イベント処理」と
  *     「ストリーム読み込み」を1本のループで回す。フレームが来ない間も
  *     ウィンドウ操作（リサイズ・終了）に反応できる。
  *   - フレームは部分的に届く（パイプ/TCP は任意の位置で分割される）ため、
@@ -15,16 +22,22 @@
  *   - ピクセルは [B,G,R,X] 並び（proto.h）。これは SDL の
  *     SDL_PIXELFORMAT_ARGB8888（リトルエンディアンで同じメモリ配置）に
  *     一致するので変換なしでテクスチャに流し込める。
+ *   - キーは SDL スキャンコード → evdev 変換表（keymap-sdl-evdev.h）で
+ *     写像して送る。キーリピートは送らない（Wayland ではリピートは
+ *     受信側クライアントが自前で行うため、押しっぱなしで自然に効く）。
  */
+#include "keymap-sdl-evdev.h"
 #include "proto.h"
 #include <SDL.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -53,10 +66,85 @@ static int read_exact(int fd, void *buf, size_t len) {
   return 0;
 }
 
-int main(void) {
+static int write_all(int fd, const void *buf, size_t len) {
+  const uint8_t *p = buf;
+  while (len > 0) {
+    ssize_t n = write(fd, p, len);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    p += n;
+    len -= (size_t)n;
+  }
+  return 0;
+}
+
+/* 入力メッセージを1件送る。失敗したら以後の入力転送を止める（*out_fd を
+ * -1 にする）が、表示は続行する */
+static void send_input(int *out_fd, uint8_t type, uint32_t a, uint32_t b) {
+  if (*out_fd < 0)
+    return;
+  uint8_t msg[WLRD_INPUT_MSG_SIZE];
+  wlrd_put_input(msg, type, a, b);
+  if (write_all(*out_fd, msg, sizeof msg) < 0) {
+    fprintf(stderr, "注意: 入力チャネルが閉じた、以後は表示のみ\n");
+    *out_fd = -1;
+  }
+}
+
+/* トランスポートコマンドを起動し双方向パイプを張る。
+ * 戻り値: 子の pid。*in_fd = 子の stdout, *out_fd = 子の stdin */
+static pid_t spawn_transport(char **argv, int *in_fd, int *out_fd) {
+  int to_child[2], from_child[2];
+  if (pipe(to_child) < 0 || pipe(from_child) < 0) {
+    perror("pipe");
+    exit(1);
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    exit(1);
+  }
+  if (pid == 0) { /* 子: パイプを stdin/stdout に付け替えて exec */
+    dup2(to_child[0], STDIN_FILENO);
+    dup2(from_child[1], STDOUT_FILENO);
+    close(to_child[0]);
+    close(to_child[1]);
+    close(from_child[0]);
+    close(from_child[1]);
+    execvp(argv[0], argv);
+    perror(argv[0]);
+    _exit(127);
+  }
+  close(to_child[0]);
+  close(from_child[1]);
+  *in_fd = from_child[0];
+  *out_fd = to_child[1];
+  return pid;
+}
+
+int main(int argc, char **argv) {
+  int in_fd = STDIN_FILENO;
+  int out_fd = -1;
+  pid_t child = -1;
+
+  /* 子（トランスポート）への write で落ちないように */
+  signal(SIGPIPE, SIG_IGN);
+
+  if (argc > 1) {
+    /* 引数 = トランスポートコマンド。双方向パイプで入力も送れる */
+    child = spawn_transport(argv + 1, &in_fd, &out_fd);
+  } else if (!isatty(STDOUT_FILENO)) {
+    /* 上級用法: stdout がパイプなら入力メッセージをそこへ流す
+     * （FIFO で自前配管する場合） */
+    out_fd = STDOUT_FILENO;
+  }
+
   /* ---- ストリームヘッダ（この時点ではブロッキング読みでよい） ---- */
   uint8_t shdr[WLRD_STREAM_HDR_SIZE];
-  if (read_exact(STDIN_FILENO, shdr, sizeof shdr) < 0) {
+  if (read_exact(in_fd, shdr, sizeof shdr) < 0) {
     fprintf(stderr, "エラー: ストリームヘッダを読めない"
                     "（wlrd-send からパイプで繋いでいるか？）\n");
     return 1;
@@ -100,7 +188,7 @@ int main(void) {
   }
 
   /* ---- 受信状態機械 ---- */
-  fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
+  fcntl(in_fd, F_SETFL, O_NONBLOCK);
   uint8_t fhdr[WLRD_FRAME_HDR_SIZE];
   uint8_t *payload = malloc(frame_bytes);
   if (!payload) {
@@ -119,18 +207,89 @@ int main(void) {
   int running = 1;
   int eof = 0;
   while (running) {
-    /* ウィンドウイベント処理（フレームが来なくても回る） */
+    /* ウィンドウイベント処理（フレームが来なくても回る）。
+     * 入力転送が有効なら、マウス・キーをメッセージにしてリモートへ送る */
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-      if (e.type == SDL_QUIT ||
-          (e.type == SDL_KEYDOWN && (e.key.keysym.sym == SDLK_q ||
-                                     e.key.keysym.sym == SDLK_ESCAPE)))
+      switch (e.type) {
+      case SDL_QUIT:
         running = 0;
+        break;
+
+      case SDL_MOUSEMOTION:
+        /* 論理サイズ (SDL_RenderSetLogicalSize) を設定してあるので
+         * イベント座標は SDL がリモート解像度系に変換済み */
+        if (e.motion.x >= 0 && e.motion.y >= 0)
+          send_input(&out_fd, WLRD_INPUT_MOTION, (uint32_t)e.motion.x,
+                     (uint32_t)e.motion.y);
+        break;
+
+      case SDL_MOUSEBUTTONDOWN:
+      case SDL_MOUSEBUTTONUP: {
+        uint32_t btn = 0; /* evdev の BTN_* コード */
+        switch (e.button.button) {
+        case SDL_BUTTON_LEFT:
+          btn = BTN_LEFT;
+          break;
+        case SDL_BUTTON_MIDDLE:
+          btn = BTN_MIDDLE;
+          break;
+        case SDL_BUTTON_RIGHT:
+          btn = BTN_RIGHT;
+          break;
+        case SDL_BUTTON_X1:
+          btn = BTN_SIDE;
+          break;
+        case SDL_BUTTON_X2:
+          btn = BTN_EXTRA;
+          break;
+        }
+        if (btn)
+          send_input(&out_fd, WLRD_INPUT_BUTTON, btn,
+                     e.type == SDL_MOUSEBUTTONDOWN ? 1 : 0);
+        break;
+      }
+
+      case SDL_MOUSEWHEEL: {
+        /* SDL は上回転が +y、wl_pointer は上スクロールが負。符号を反転 */
+        int32_t vy = -e.wheel.y;
+        int32_t vx = e.wheel.x;
+        if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+          vy = -vy;
+          vx = -vx;
+        }
+        if (vy)
+          send_input(&out_fd, WLRD_INPUT_AXIS, 0, (uint32_t)vy);
+        if (vx)
+          send_input(&out_fd, WLRD_INPUT_AXIS, 1, (uint32_t)vx);
+        break;
+      }
+
+      case SDL_KEYDOWN:
+      case SDL_KEYUP: {
+        /* 見るだけモードのときだけ q/ESC をローカル終了に使う */
+        if (out_fd < 0) {
+          if (e.type == SDL_KEYDOWN && (e.key.keysym.sym == SDLK_q ||
+                                        e.key.keysym.sym == SDLK_ESCAPE))
+            running = 0;
+          break;
+        }
+        if (e.key.repeat)
+          break; /* リピートは受信側クライアントが自前で行う */
+        uint16_t code = 0;
+        if (e.key.keysym.scancode < SDL_NUM_SCANCODES)
+          code = wlrd_sdl_to_evdev[e.key.keysym.scancode];
+        if (code)
+          send_input(&out_fd, WLRD_INPUT_KEY, code,
+                     e.type == SDL_KEYDOWN ? 1 : 0);
+        break;
+      }
+      }
     }
 
-    /* stdin が読めるようになるまで最大 15ms 待つ（その間も上の
+    /* 受信 fd が読めるようになるまで最大 15ms 待つ（その間も上の
      * イベント処理に定期的に戻ってくる） */
-    struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+    struct pollfd pfd = {.fd = in_fd, .events = POLLIN};
     int pr = poll(&pfd, 1, 15);
     if (pr <= 0 && !eof)
       continue;
@@ -140,7 +299,7 @@ int main(void) {
     for (;;) {
       uint8_t *dst = in_payload ? payload : fhdr;
       size_t want = in_payload ? frame_bytes : sizeof fhdr;
-      ssize_t n = read(STDIN_FILENO, dst + got, want - got);
+      ssize_t n = read(in_fd, dst + got, want - got);
       if (n == 0) { /* EOF: 送信側が終了した */
         eof = 1;
         running = 0;
@@ -209,5 +368,14 @@ int main(void) {
   SDL_DestroyRenderer(ren);
   SDL_DestroyWindow(win);
   SDL_Quit();
+
+  /* トランスポート子プロセスの後始末: 入力チャネルを閉じれば send 側が
+   * EOF を検知して自発的に終了する（シグナル不要） */
+  if (child > 0) {
+    if (out_fd >= 0)
+      close(out_fd);
+    close(in_fd);
+    waitpid(child, NULL, 0);
+  }
   return 0;
 }
