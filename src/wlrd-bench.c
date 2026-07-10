@@ -2,10 +2,12 @@
  * wlrd-bench.c — Stage 2: 連続キャプチャの FPS と damage（変化領域）を測定する
  *
  * 使い方:
- *   ./wlrd-bench [-t 秒] [-f] [-c]
+ *   ./wlrd-bench [-t 秒] [-f] [-c] [-o 出力番号] [-l]
  *     -t 秒  測定時間（既定 10 秒）
  *     -f     copy_with_damage を使わず毎フレーム全面コピーする
  *     -c     カーソルを合成してキャプチャする
+ *     -o n   キャプチャする出力（モニタ）の番号。-l で一覧を確認する
+ *     -l     出力の一覧（番号と接続名）を表示して終了する
  *
  * 出力:
  *   stdout: 1フレーム1行の TSV（gnuplot / awk でそのまま解析できる）
@@ -34,11 +36,19 @@
 #include <wayland-client.h>
 #include "wlr-screencopy-unstable-v1.h"
 
+#define MAX_OUTPUTS 8
+
 struct state {
 	/* グローバル */
 	struct wl_shm *shm;
-	struct wl_output *output;
 	struct zwlr_screencopy_manager_v1 *screencopy;
+
+	/* 見つかった出力の一覧と、キャプチャ対象に選んだ1つ。
+	 * 名前は wl_output v4 の name イベント（DP-5 等の接続名）で埋まる */
+	struct wl_output *outputs[MAX_OUTPUTS];
+	char output_names[MAX_OUTPUTS][64];
+	int n_outputs;
+	struct wl_output *output;
 
 	/* コンポジタが提示してきたバッファ仕様（フレーム毎に届く） */
 	uint32_t format, width, height, stride;
@@ -71,6 +81,58 @@ static uint64_t now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+/* --------------------------------------------------------------- wl_output */
+
+/* wl_output のイベント。必要なのは name だけだが、リスナー構造体は
+ * 全メンバを埋める必要がある（NULL のままだと未実装イベント受信で落ちる） */
+static void output_geometry(void *data, struct wl_output *output,
+                            int32_t x, int32_t y, int32_t phys_w, int32_t phys_h,
+                            int32_t subpixel, const char *make, const char *model,
+                            int32_t transform)
+{
+	(void)data; (void)output; (void)x; (void)y; (void)phys_w; (void)phys_h;
+	(void)subpixel; (void)make; (void)model; (void)transform;
+}
+
+static void output_mode(void *data, struct wl_output *output, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh)
+{
+	(void)data; (void)output; (void)flags; (void)width; (void)height; (void)refresh;
+}
+
+static void output_done(void *data, struct wl_output *output)
+{
+	(void)data; (void)output;
+}
+
+static void output_scale(void *data, struct wl_output *output, int32_t factor)
+{
+	(void)data; (void)output; (void)factor;
+}
+
+/* v4: "DP-5" のような接続名。data には名前の格納先を直接渡してある */
+static void output_name(void *data, struct wl_output *output, const char *name)
+{
+	(void)output;
+	snprintf((char *)data, sizeof(((struct state *)0)->output_names[0]),
+	         "%s", name);
+}
+
+static void output_description(void *data, struct wl_output *output,
+                               const char *description)
+{
+	(void)data; (void)output; (void)description;
+}
+
+static const struct wl_output_listener output_listener = {
+	.geometry    = output_geometry,
+	.mode        = output_mode,
+	.done        = output_done,
+	.scale       = output_scale,
+	.name        = output_name,
+	.description = output_description,
+};
+
 /* ---------------------------------------------------------------- registry */
 
 static void registry_global(void *data, struct wl_registry *registry,
@@ -81,8 +143,18 @@ static void registry_global(void *data, struct wl_registry *registry,
 	if (strcmp(interface, wl_shm_interface.name) == 0) {
 		st->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
-		if (!st->output)
-			st->output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+		if (st->n_outputs < MAX_OUTPUTS) {
+			int i = st->n_outputs++;
+			/* name イベントは v4 から。それ未満なら番号だけで表示する */
+			uint32_t v = version < 4 ? version : 4;
+			st->outputs[i] = wl_registry_bind(registry, name,
+			                                  &wl_output_interface, v);
+			snprintf(st->output_names[i], sizeof st->output_names[i],
+			         "(output %d)", i);
+			if (v >= 4)
+				wl_output_add_listener(st->outputs[i], &output_listener,
+				                       st->output_names[i]);
+		}
 	} else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
 		/* copy_with_damage は v2、buffer_done は v3 で導入 */
 		uint32_t v = version < 3 ? version : 3;
@@ -277,15 +349,20 @@ int main(int argc, char **argv)
 	int duration_s = 10;
 	int full_copy = 0;
 	int overlay_cursor = 0;
+	int out_idx = 0;
+	int list_only = 0;
 
 	int opt;
-	while ((opt = getopt(argc, argv, "t:fch")) != -1) {
+	while ((opt = getopt(argc, argv, "t:fco:lh")) != -1) {
 		switch (opt) {
 		case 't': duration_s = atoi(optarg); break;
 		case 'f': full_copy = 1; break;
 		case 'c': overlay_cursor = 1; break;
+		case 'o': out_idx = atoi(optarg); break;
+		case 'l': list_only = 1; break;
 		default:
-			fprintf(stderr, "使い方: %s [-t 秒] [-f 全面コピー] [-c カーソル込み]\n",
+			fprintf(stderr, "使い方: %s [-t 秒] [-f 全面コピー] "
+			        "[-c カーソル込み] [-o 出力番号] [-l 出力一覧]\n",
 			        argv[0]);
 			return 2;
 		}
@@ -306,15 +383,31 @@ int main(int argc, char **argv)
 
 	struct wl_registry *registry = wl_display_get_registry(display);
 	wl_registry_add_listener(registry, &registry_listener, &st);
+	/* 1回目: global イベント（bind）。2回目: bind した wl_output の
+	 * name イベントを受け取るため */
+	wl_display_roundtrip(display);
 	wl_display_roundtrip(display);
 
-	if (!st.shm || !st.output || !st.screencopy) {
+	if (list_only) {
+		for (int i = 0; i < st.n_outputs; i++)
+			printf("%d\t%s\n", i, st.output_names[i]);
+		return 0;
+	}
+
+	if (!st.shm || st.n_outputs == 0 || !st.screencopy) {
 		fprintf(stderr, "エラー: 必要なプロトコルが不足している\n");
 		return 1;
 	}
+	if (out_idx < 0 || out_idx >= st.n_outputs) {
+		fprintf(stderr, "エラー: 出力番号 %d は範囲外（0〜%d。-l で一覧）\n",
+		        out_idx, st.n_outputs - 1);
+		return 2;
+	}
+	st.output = st.outputs[out_idx];
 
-	fprintf(stderr, "測定開始: %d 秒, モード=%s\n",
-	        duration_s, full_copy ? "全面コピー" : "copy_with_damage");
+	fprintf(stderr, "測定開始: %d 秒, 出力=%s, モード=%s\n",
+	        duration_s, st.output_names[out_idx],
+	        full_copy ? "全面コピー" : "copy_with_damage");
 	printf("# idx\tt_ms\tdt_ms\trects\tdmg_px\tdmg_pct\n");
 
 	uint64_t t_start = now_ns();
